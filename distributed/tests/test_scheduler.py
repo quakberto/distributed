@@ -8,23 +8,23 @@ from operator import add, mul
 import sys
 
 from dask import delayed
-from toolz import merge, concat, valmap, first, frequencies
+from toolz import merge, concat, valmap, first, frequencies, pluck
 from tornado import gen
 
 import pytest
 
-from distributed import Nanny, Worker, Client, wait
+from distributed import Nanny, Worker, Client, wait, fire_and_forget
 from distributed.core import connect, rpc, CommClosedError
 from distributed.scheduler import validate_state, Scheduler, BANDWIDTH
 from distributed.client import wait
 from distributed.metrics import time
 from distributed.protocol.pickle import dumps
 from distributed.worker import dumps_function, dumps_task
-from distributed.utils_test import (inc, dec, gen_cluster, gen_test,
-                                    readone, slowinc, slowadd, cluster, div)
-from distributed.utils_test import loop # flake8: noqa
 from distributed.utils import tmpfile
-from distributed.utils_test import slow
+from distributed.utils_test import (inc, dec, gen_cluster, gen_test, readone,
+                                    slowinc, slowadd, slowdec, cluster, div,
+                                    varying, slow)
+from distributed.utils_test import loop, nodebug  # flake8: noqa
 from dask.compatibility import apply
 
 
@@ -700,7 +700,7 @@ def test_io_loop(loop):
 
 
 @gen_cluster(client=True)
-def test_transition_story(c, s, a, b):
+def test_story(c, s, a, b):
     x = delayed(inc)(1)
     y = delayed(inc)(x)
     f = c.persist(y)
@@ -708,26 +708,12 @@ def test_transition_story(c, s, a, b):
 
     assert s.transition_log
 
-    story = s.transition_story(x.key)
+    story = s.story(x.key)
     assert all(line in s.transition_log for line in story)
     assert len(story) < len(s.transition_log)
     assert all(x.key == line[0] or x.key in line[-2] for line in story)
 
-    assert len(s.transition_story(x.key, y.key)) > len(story)
-
-
-@gen_test()
-def test_launch_without_blocked_services():
-    from distributed.http import HTTPScheduler
-    s = Scheduler(services={('http', 3849): HTTPScheduler})
-    s.start(0)
-
-    s2 = Scheduler(services={('http', 3849): HTTPScheduler})
-    s2.start(0)
-
-    assert not s2.services
-
-    yield [s.close(), s2.close()]
+    assert len(s.story(x.key, y.key)) > len(story)
 
 
 @gen_cluster(ncores=[], client=True)
@@ -795,7 +781,7 @@ def test_file_descriptors(c, s):
     num_fds_3 = proc.num_fds()
     assert num_fds_3 == num_fds_2
 
-    x = da.random.normal(10, 1, size=(1000, 1000), chunks=(10, 10))
+    x = da.random.random(size=(1000, 1000), chunks=(25, 25))
     x = c.persist(x)
     yield wait(x)
 
@@ -816,6 +802,7 @@ def test_file_descriptors(c, s):
     yield [n._close() for n in nannies]
 
 
+@nodebug
 @gen_cluster(client=True)
 def test_learn_occupancy(c, s, a, b):
     futures = c.map(slowinc, range(1000), delay=0.01)
@@ -827,6 +814,7 @@ def test_learn_occupancy(c, s, a, b):
         assert 1 < s.occupancy[w.address] < 20
 
 
+@nodebug
 @gen_cluster(client=True)
 def test_learn_occupancy_2(c, s, a, b):
     future = c.map(slowinc, range(1000), delay=0.1)
@@ -836,6 +824,22 @@ def test_learn_occupancy_2(c, s, a, b):
     assert 50 < s.total_occupancy < 200
 
 
+@gen_cluster(client=True)
+def test_occupancy_cleardown(c, s, a, b):
+    s.validate = False
+
+    # Inject excess values in s.occupancy
+    s.occupancy[a.address] = 2
+    s.total_occupancy += 2
+    futures = c.map(slowinc, range(100), delay=0.01)
+    yield wait(futures)
+
+    # Verify that occupancy values have been zeroed out
+    assert abs(s.total_occupancy) < 0.01
+    assert all(v == 0 for v in s.occupancy.values())
+
+
+@nodebug
 @gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 30)
 def test_balance_many_workers(c, s, *workers):
     futures = c.map(slowinc, range(20), delay=0.2)
@@ -843,6 +847,7 @@ def test_balance_many_workers(c, s, *workers):
     assert set(map(len, s.has_what.values())) == {0, 1}
 
 
+@nodebug
 @gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 30)
 def test_balance_many_workers_2(c, s, *workers):
     s.extensions['stealing']._pc.callback_time = 100000000
@@ -1122,15 +1127,18 @@ def test_correct_bad_time_estimate(c, s, *workers):
     assert all(w.data for w in workers)
 
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason="Need 127.0.0.2 to mean localhost")
 @gen_test(timeout=None)
 def test_service_hosts_match_scheduler():
-    from distributed.http.scheduler import HTTPScheduler
-    services = {('http', 0): HTTPScheduler}
+    pytest.importorskip('bokeh')
+    from distributed.bokeh.scheduler import BokehScheduler
+    services = {('bokeh', 0): BokehScheduler}
 
     s = Scheduler(services=services)
     yield s.start('tcp://0.0.0.0')
 
-    sock = first(s.services['http']._sockets.values())
+    sock = first(s.services['bokeh'].server._http._sockets.values())
     assert sock.getsockname()[0] in ('::', '0.0.0.0')
     yield s.close()
 
@@ -1138,6 +1146,120 @@ def test_service_hosts_match_scheduler():
         s = Scheduler(services=services)
         yield s.start(host)
 
-        sock = first(s.services['http']._sockets.values())
+        sock = first(s.services['bokeh'].server._http._sockets.values())
         assert sock.getsockname()[0] == '127.0.0.2'
         yield s.close()
+
+
+@gen_cluster(client=True, worker_kwargs={'profile_cycle_interval': 100})
+def test_profile_metadata(c, s, a, b):
+    start = time() - 1
+    futures = c.map(slowinc, range(10), delay=0.05, workers=a.address)
+    yield wait(futures)
+    yield gen.sleep(0.200)
+
+    meta = yield s.get_profile_metadata(profile_cycle_interval=0.100)
+    now = time() + 1
+    assert meta
+    assert all(start < t < now for t, count in meta['counts'])
+    assert all(0 <= count < 30 for t, count in meta['counts'][:4])
+    assert not meta['counts'][-1][1]
+
+
+@gen_cluster(client=True, worker_kwargs={'profile_cycle_interval': 100})
+def test_profile_metadata_keys(c, s, a, b):
+    start = time() - 1
+    x = c.map(slowinc, range(10), delay=0.05)
+    y = c.map(slowdec, range(10), delay=0.05)
+    yield wait(x + y)
+
+    meta = yield s.get_profile_metadata(profile_cycle_interval=0.100)
+    assert set(meta['keys']) == {'slowinc', 'slowdec'}
+    assert len(meta['counts']) == len(meta['keys']['slowinc'])
+
+
+@gen_cluster(client=True)
+def test_cancel_fire_and_forget(c, s, a, b):
+    x = delayed(slowinc)(1, delay=0.05)
+    y = delayed(slowinc)(x, delay=0.05)
+    z = delayed(slowinc)(y, delay=0.05)
+    w = delayed(slowinc)(z, delay=0.05)
+    future = c.compute(w)
+    fire_and_forget(future)
+
+    yield gen.sleep(0.05)
+    yield future.cancel(force=True)
+    assert future.status == 'cancelled'
+    assert not s.task_state
+
+
+@gen_cluster(client=True, Worker=Nanny)
+def test_log_tasks_during_restart(c, s, a, b):
+    future = c.submit(sys.exit, 0)
+    yield wait(future)
+    assert 'exit' in str(s.events)
+
+
+@gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 2)
+def test_reschedule(c, s, a, b):
+    yield c.submit(slowinc, -1, delay=0.1)  # learn cost
+    x = c.map(slowinc, range(4), delay=0.1)
+
+    # add much more work onto worker a
+    futures = c.map(slowinc, range(10, 20), delay=0.1, workers=a.address)
+
+    while len(s.task_state) < len(x) + len(futures):
+        yield gen.sleep(0.001)
+
+    for future in x:
+        s.reschedule(key=future.key)
+
+    # Worker b gets more of the original tasks
+    yield wait(x)
+    assert sum(future.key in b.data for future in x) >= 3
+    assert sum(future.key in a.data for future in x) <= 1
+
+
+@gen_cluster(client=True)
+def test_get_task_status(c, s, a, b):
+    future = c.submit(inc, 1)
+    yield wait(future)
+
+    result = yield a.scheduler.get_task_status(keys=[future.key])
+    assert result == {future.key: 'memory'}
+
+
+def test_deque_handler():
+    from distributed.scheduler import deque_handler, logger
+    logger.info('foo123')
+    assert deque_handler.deque
+    msg = deque_handler.deque[-1]
+    assert 'distributed.scheduler' in deque_handler.format(msg)
+    assert any(msg.msg == 'foo123' for msg in deque_handler.deque)
+
+
+@gen_cluster(client=True)
+def test_retries(c, s, a, b):
+    args = [ZeroDivisionError("one"), ZeroDivisionError("two"), 42]
+
+    future = c.submit(varying(args), retries=3)
+    result = yield future
+    assert result == 42
+    assert s.retries[future.key] == 1
+    assert future.key not in s.exceptions
+
+    future = c.submit(varying(args), retries=2, pure=False)
+    result = yield future
+    assert result == 42
+    assert s.retries[future.key] == 0
+    assert future.key not in s.exceptions
+
+    future = c.submit(varying(args), retries=1, pure=False)
+    with pytest.raises(ZeroDivisionError) as exc_info:
+        res = yield future
+    exc_info.match("two")
+
+    future = c.submit(varying(args), retries=0, pure=False)
+    with pytest.raises(ZeroDivisionError) as exc_info:
+        res = yield future
+    exc_info.match("one")

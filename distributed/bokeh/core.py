@@ -1,7 +1,12 @@
 from __future__ import print_function, division, absolute_import
 
+from distutils.version import LooseVersion
+
 import bokeh
 from bokeh.server.server import Server
+
+if LooseVersion(bokeh.__version__) < LooseVersion('0.12.6'):
+    raise ImportError("Dask needs bokeh >= 0.12.6")
 
 
 class BokehServer(object):
@@ -17,23 +22,13 @@ class BokehServer(object):
             ip = None
         for i in range(5):
             try:
-                if bokeh.__version__ <= '0.12.4':
-                    kwargs = {'host': ['*']}
-                else:
-                    kwargs = {}
-
-                kwargs.update(self.server_kwargs)
-
                 self.server = Server(self.apps, io_loop=self.loop,
                                      port=port, address=ip,
                                      check_unused_sessions_milliseconds=500,
                                      allow_websocket_origin=["*"],
-                                     **kwargs)
-                if bokeh.__version__ <= '0.12.3':
-                    self.server.start(start_loop=False)
-                else:
-                    self.server.start()
-                break
+                                     **self.server_kwargs)
+                self.server.start()
+                return
             except (SystemExit, EnvironmentError):
                 port = 0
                 if i == 4:
@@ -54,24 +49,5 @@ class BokehServer(object):
             self.server._tornado._ping_job.stop()
 
         # https://github.com/bokeh/bokeh/issues/5494
-        if bokeh.__version__ >= '0.12.4':
+        if LooseVersion(bokeh.__version__) >= '0.12.4':
             self.server.stop()
-
-
-def format_time(n):
-    """ format integers as time
-
-    >>> format_time(1)
-    '1.00 s'
-    >>> format_time(0.001234)
-    '1.23 ms'
-    >>> format_time(0.00012345)
-    '123.45 us'
-    >>> format_time(123.456)
-    '123.46 s'
-    """
-    if n >= 1:
-        return '%.2f s' % n
-    if n >= 1e-3:
-        return '%.2f ms' % (n * 1e3)
-    return '%.2f us' % (n * 1e6)

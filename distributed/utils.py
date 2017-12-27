@@ -1,12 +1,14 @@
 from __future__ import print_function, division, absolute_import
 
 import atexit
-from collections import Iterable
+from collections import Iterable, deque
 from contextlib import contextmanager
 from datetime import timedelta
 import functools
+import gc
 import json
 import logging
+import math
 import multiprocessing
 import operator
 import os
@@ -15,13 +17,14 @@ import shutil
 import socket
 from time import sleep
 from importlib import import_module
-
-import six
 import sys
-import tblib.pickling_support
 import tempfile
 import threading
 import warnings
+import weakref
+
+import six
+import tblib.pickling_support
 
 from .compatibility import cache_from_source, getargspec, invalidate_caches, reload
 
@@ -32,20 +35,28 @@ except ImportError:
 
 from dask import istask
 from toolz import memoize, valmap
+import tornado
 from tornado import gen
+from tornado.ioloop import IOLoop, PollIOLoop
 
 from .compatibility import Queue, PY3, PY2, get_thread_identity, unicode
 from .config import config
 from .metrics import time
 
 
-thread_state = threading.local()
+try:
+    from dask.context import thread_state
+except ImportError:
+    thread_state = threading.local()
 
-logger = logging.getLogger(__name__)
+logger = _logger = logging.getLogger(__name__)
+
+
+no_default = '__no_default__'
 
 
 def _initialize_mp_context():
-    if PY3 and not sys.platform.startswith('win'):
+    if PY3 and not sys.platform.startswith('win') and 'PyPy' not in sys.version:
         method = config.get('multiprocessing-method', 'forkserver')
         ctx = multiprocessing.get_context(method)
         # Makes the test suite much faster
@@ -199,6 +210,10 @@ def sync(loop, func, *args, **kwargs):
     """
     Run coroutine in loop running in separate thread.
     """
+    # Tornado's PollIOLoop doesn't raise when using closed, do it ourselves
+    if isinstance(loop, PollIOLoop) and getattr(loop, '_closing', False):
+        raise RuntimeError("IOLoop is closed")
+
     timeout = kwargs.pop('callback_timeout', None)
 
     def make_coro():
@@ -207,12 +222,6 @@ def sync(loop, func, *args, **kwargs):
             return coro
         else:
             return gen.with_timeout(timedelta(seconds=timeout), coro)
-
-    if not loop._running:
-        try:
-            return loop.run_sync(make_coro)
-        except RuntimeError:  # loop already running
-            pass
 
     e = threading.Event()
     main_tid = get_thread_identity()
@@ -235,12 +244,172 @@ def sync(loop, func, *args, **kwargs):
             e.set()
 
     loop.add_callback(f)
-    while not e.is_set():
-        e.wait(1000000)
+    if timeout is not None:
+        if not e.wait(timeout):
+            raise gen.TimeoutError("timed out after %s s." % (timeout,))
+    else:
+        while not e.is_set():
+            e.wait(1000000)
     if error[0]:
         six.reraise(*error[0])
     else:
         return result[0]
+
+
+class LoopRunner(object):
+    """
+    A helper to start and stop an IO loop in a controlled way.
+    Several loop runners can associate safely to the same IO loop.
+
+    Parameters
+    ----------
+    loop: IOLoop (optional)
+        If given, this loop will be re-used, otherwise an appropriate one
+        will be looked up or created.
+    asynchronous: boolean (optional, default False)
+        If false (the default), the loop is meant to run in a separate
+        thread and will be started if necessary.
+        If true, the loop is meant to run in the thread this
+        object is instantiated from, and will not be started automatically.
+    """
+    # All loops currently associated to loop runners
+    _all_loops = weakref.WeakKeyDictionary()
+    _lock = threading.Lock()
+
+    def __init__(self, loop=None, asynchronous=False):
+        if loop is None:
+            if asynchronous:
+                self._loop = IOLoop.current()
+            else:
+                # We're expecting the loop to run in another thread,
+                # avoid re-using this thread's assigned loop
+                self._loop = IOLoop()
+            self._should_close_loop = True
+        else:
+            self._loop = loop
+            self._should_close_loop = False
+        self._asynchronous = asynchronous
+        self._loop_thread = None
+        self._started = False
+        with self._lock:
+            self._all_loops.setdefault(self._loop, (0, None))
+
+    def start(self):
+        """
+        Start the IO loop if required.  The loop is run in a dedicated
+        thread.
+
+        If the loop is already running, this method does nothing.
+        """
+        with self._lock:
+            self._start_unlocked()
+
+    def _start_unlocked(self):
+        assert not self._started
+
+        count, real_runner = self._all_loops[self._loop]
+        if (self._asynchronous or real_runner is not None or count > 0):
+            self._all_loops[self._loop] = count + 1, real_runner
+            self._started = True
+            return
+
+        assert self._loop_thread is None
+        assert count == 0
+
+        loop_evt = threading.Event()
+        done_evt = threading.Event()
+        in_thread = [None]
+        start_exc = [None]
+
+        def loop_cb():
+            in_thread[0] = threading.current_thread()
+            loop_evt.set()
+
+        def run_loop(loop=self._loop):
+            loop.add_callback(loop_cb)
+            try:
+                loop.start()
+            except Exception as e:
+                start_exc[0] = e
+            finally:
+                done_evt.set()
+
+        thread = threading.Thread(target=run_loop,
+                                  name="IO loop")
+        thread.daemon = True
+        thread.start()
+
+        loop_evt.wait(timeout=1000)
+        self._started = True
+
+        actual_thread = in_thread[0]
+        if actual_thread is not thread:
+            # Loop already running in other thread (user-launched)
+            done_evt.wait(5)
+            if not isinstance(start_exc[0], RuntimeError):
+                raise start_exc[0]
+            self._all_loops[self._loop] = count + 1, None
+        else:
+            assert start_exc[0] is None, start_exc
+            self._loop_thread = thread
+            self._all_loops[self._loop] = count + 1, self
+
+    def stop(self, timeout=10):
+        """
+        Stop and close the loop if it was created by us.
+        Otherwise, just mark this object "stopped".
+        """
+        with self._lock:
+            self._stop_unlocked(timeout)
+
+    def _stop_unlocked(self, timeout):
+        if not self._started:
+            return
+
+        self._started = False
+
+        count, real_runner = self._all_loops[self._loop]
+        if count > 1:
+            self._all_loops[self._loop] = count - 1, real_runner
+        else:
+            assert count == 1
+            del self._all_loops[self._loop]
+            if real_runner is not None:
+                real_runner._real_stop(timeout)
+
+    def _real_stop(self, timeout):
+        assert self._loop_thread is not None
+        if self._loop_thread is not None:
+            try:
+                self._loop.add_callback(self._loop.stop)
+                self._loop_thread.join(timeout=timeout)
+                self._loop.close()
+            finally:
+                self._loop_thread = None
+
+    def is_started(self):
+        """
+        Return True between start() and stop() calls, False otherwise.
+        """
+        return self._started
+
+    def run_sync(self, func, *args, **kwargs):
+        """
+        Convenience helper: start the loop if needed,
+        run sync(func, *args, **kwargs), then stop the loop again.
+        """
+        if self._started:
+            return sync(self.loop, func, *args, **kwargs)
+        else:
+            self.start()
+            try:
+                return sync(self.loop, func, *args, **kwargs)
+            finally:
+                self.stop()
+
+    @property
+    def loop(self):
+        return self._loop
 
 
 @contextmanager
@@ -312,6 +481,8 @@ def key_split(s):
     'x'
     >>> key_split("('x-2', 1)")
     'x'
+    >>> key_split("('x', 1)")
+    'x'
     >>> key_split('hello-world-1')
     'hello-world'
     >>> key_split(b'hello-world-1')
@@ -332,7 +503,7 @@ def key_split(s):
     try:
         words = s.split('-')
         if not words[0][0].isalpha():
-            result = words[0].lstrip("'(\"")
+            result = words[0].split(",")[0].strip("'(\"")
         else:
             result = words[0]
         for word in words[1:]:
@@ -921,9 +1092,9 @@ def asciitable(columns, rows):
 
 
 if PY2:
-    def nbytes(frame):
+    def nbytes(frame, _bytes_like=(bytes, bytearray, buffer)):
         """ Number of bytes of a frame or memoryview """
-        if isinstance(frame, (bytes, buffer)):
+        if isinstance(frame, _bytes_like):
             return len(frame)
         elif isinstance(frame, memoryview):
             if frame.shape is None:
@@ -934,12 +1105,23 @@ if PY2:
         else:
             return frame.nbytes
 else:
-    def nbytes(frame):
+    def nbytes(frame, _bytes_like=(bytes, bytearray)):
         """ Number of bytes of a frame or memoryview """
-        if isinstance(frame, bytes):
+        if isinstance(frame, _bytes_like):
             return len(frame)
         else:
             return frame.nbytes
+
+
+def PeriodicCallback(callback, callback_time, io_loop=None):
+    """
+    Wrapper around tornado.IOLoop.PeriodicCallback, for compatibility
+    with removal of the `io_loop` parameter in Tornado 5.0.
+    """
+    if tornado.version_info >= (5,):
+        return tornado.ioloop.PeriodicCallback(callback, callback_time)
+    else:
+        return tornado.ioloop.PeriodicCallback(callback, callback_time, io_loop)
 
 
 @contextmanager
@@ -964,3 +1146,107 @@ def json_load_robust(fn, load=json.load):
         except (ValueError, KeyError):  # race with writing process
             pass
         sleep(0.1)
+
+
+def format_time(n):
+    """ format integers as time
+
+    >>> format_time(1)
+    '1.00 s'
+    >>> format_time(0.001234)
+    '1.23 ms'
+    >>> format_time(0.00012345)
+    '123.45 us'
+    >>> format_time(123.456)
+    '123.46 s'
+    """
+    if n >= 1:
+        return '%.2f s' % n
+    if n >= 1e-3:
+        return '%.2f ms' % (n * 1e3)
+    return '%.2f us' % (n * 1e6)
+
+
+class DequeHandler(logging.Handler):
+    """ A logging.Handler that records records into a deque """
+    def __init__(self, *args, **kwargs):
+        n = kwargs.pop('n', 10000)
+        self.deque = deque(maxlen=n)
+        super(DequeHandler, self).__init__(*args, **kwargs)
+
+    def emit(self, record):
+        self.deque.append(record)
+
+
+class ThrottledGC(object):
+    """Wrap gc.collect to protect against excessively repeated calls.
+
+    Allows to run throttled garbage collection in the workers as a
+    countermeasure to e.g.: https://github.com/dask/zict/issues/19
+
+    collect() does nothing when repeated calls are so costly and so frequent
+    that the thread would spend more than max_in_gc_frac doing GC.
+
+    warn_if_longer is a duration in seconds (10s by default) that can be used
+    to log a warning level message whenever an actual call to gc.collect()
+    lasts too long.
+    """
+    def __init__(self, max_in_gc_frac=0.05, warn_if_longer=1, logger=None):
+        self.max_in_gc_frac = max_in_gc_frac
+        self.warn_if_longer = warn_if_longer
+        self.last_collect = time()
+        self.last_gc_duration = 0
+        self.logger = logger if logger is not None else _logger
+
+    def collect(self):
+        # In case of non-monotonicity in the clock, assume that any Python
+        # operation lasts at least 1e-6 second.
+        collect_start = time()
+        elapsed = max(collect_start - self.last_collect, 1e-6)
+        if self.last_gc_duration / elapsed < self.max_in_gc_frac:
+            self.logger.debug("Calling gc.collect(). %0.3fs elapsed since "
+                              "previous call.", elapsed)
+            gc.collect()
+            self.last_collect = collect_start
+            self.last_gc_duration = max(time() - collect_start, 1e-6)
+            if self.last_gc_duration > self.warn_if_longer:
+                self.logger.warning("gc.collect() took %0.3fs. This is usually"
+                                    " a sign that the some tasks handle too"
+                                    " many Python objects at the same time."
+                                    " Rechunking the work into smaller tasks"
+                                    " might help.",
+                                    self.last_gc_duration)
+            else:
+                self.logger.debug("gc.collect() took %0.3fs",
+                                  self.last_gc_duration)
+        else:
+            self.logger.debug("gc.collect() lasts %0.3fs but only %0.3fs "
+                              "elapsed since last call: throttling.",
+                              self.last_gc_duration, elapsed)
+
+
+def fix_asyncio_event_loop_policy(asyncio):
+    """
+    Work around https://github.com/tornadoweb/tornado/issues/2183
+    """
+    class PatchedDefaultEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+
+        def get_event_loop(self):
+            """Get the event loop.
+
+            This may be None or an instance of EventLoop.
+            """
+            try:
+                return super().get_event_loop()
+            except RuntimeError:
+                # "There is no current event loop in thread"
+                loop = self.new_event_loop()
+                self.set_event_loop(loop)
+                return loop
+
+    asyncio.set_event_loop_policy(PatchedDefaultEventLoopPolicy())
+
+
+# Only bother if asyncio has been loaded by Tornado
+if 'asyncio' in sys.modules:
+    fix_asyncio_event_loop_policy(sys.modules['asyncio'])

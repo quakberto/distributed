@@ -2,12 +2,15 @@ from __future__ import print_function, division, absolute_import
 
 from contextlib import contextmanager
 from datetime import timedelta
+import functools
 import gc
 from glob import glob
+import itertools
 import inspect
 import logging
 import logging.config
 import os
+import re
 import shutil
 import signal
 import socket
@@ -16,31 +19,38 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 from time import sleep
 import uuid
 import warnings
 import weakref
 
+import psutil
+import pytest
 import six
 
+from dask.context import _globals
 from toolz import merge, memoize
 from tornado import gen, queues
 from tornado.gen import TimeoutError
 from tornado.ioloop import IOLoop
 
-from .compatibility import WINDOWS
+from .compatibility import WINDOWS, PY3
 from .config import config, initialize_logging
 from .core import connect, rpc, CommClosedError
 from .metrics import time
 from .nanny import Nanny
 from .security import Security
 from .utils import ignoring, log_errors, sync, mp_context, get_ip, get_ipv6
-from .worker import Worker
-import pytest
-import psutil
+from .worker import Worker, TOTAL_MEMORY
 
 
 logger = logging.getLogger(__name__)
+
+
+logging_levels = {name: logger.level for name, logger in
+                  logging.root.manager.loggerDict.items()
+                  if isinstance(logger, logging.Logger)}
 
 
 @pytest.fixture(scope='session')
@@ -66,29 +76,48 @@ def invalid_python_script(tmpdir_factory):
     return local_file
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def loop():
-    IOLoop.clear_instance()
-    IOLoop.clear_current()
-    loop = IOLoop()
-    loop.make_current()
-    yield loop
-    if loop._running:
-        sync(loop, loop.stop)
-    for i in range(5):
+    with pristine_loop() as loop:
+        # Monkey-patch IOLoop.start to wait for loop stop
+        orig_start = loop.start
+        is_stopped = threading.Event()
+        is_stopped.set()
+        def start():
+            is_stopped.clear()
+            try:
+                orig_start()
+            finally:
+                is_stopped.set()
+        loop.start = start
+
+        yield loop
+        # Stop the loop in case it's still running
         try:
-            loop.close(all_fds=True)
-            IOLoop.clear_instance()
-            break
-        except Exception as e:
-            f = e
-    else:
-        print(f)
-    IOLoop.clear_instance()
-    IOLoop.clear_current()
+            loop.add_callback(loop.stop)
+        except RuntimeError as e:
+            if not re.match("IOLoop is clos(ed|ing)", str(e)):
+                raise
+        else:
+            is_stopped.wait()
 
 
-@pytest.yield_fixture
+@pytest.fixture
+def loop_in_thread():
+    with pristine_loop() as loop:
+        thread = threading.Thread(target=loop.start,
+                                  name="test IOLoop")
+        thread.daemon = True
+        thread.start()
+        loop_started = threading.Event()
+        loop.add_callback(loop_started.set)
+        loop_started.wait()
+        yield loop
+        loop.add_callback(loop.stop)
+        thread.join(timeout=5)
+
+
+@pytest.fixture
 def zmq_ctx():
     import zmq
     ctx = zmq.Context.instance()
@@ -102,6 +131,7 @@ def pristine_loop():
     IOLoop.clear_current()
     loop = IOLoop()
     loop.make_current()
+    assert IOLoop.current() is loop
     try:
         yield loop
     finally:
@@ -124,6 +154,50 @@ def mock_ipython():
     with mock.patch('IPython.get_ipython', get_ip), \
             mock.patch('distributed._ipython_utils.get_ipython', get_ip):
         yield ip
+
+
+def nodebug(func):
+    """
+    A decorator to disable debug facilities during timing-sensitive tests.
+    Warning: this doesn't affect already created IOLoops.
+    """
+    if not PY3:
+        # py.test's runner magic breaks horridly on Python 2
+        # when a test function is wrapped, so avoid it
+        # (incidently, asyncio is irrelevant anyway)
+        return func
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        old_asyncio_debug = os.environ.get("PYTHONASYNCIODEBUG")
+        if old_asyncio_debug is not None:
+            del os.environ["PYTHONASYNCIODEBUG"]
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if old_asyncio_debug is not None:
+                os.environ["PYTHONASYNCIODEBUG"] = old_asyncio_debug
+
+    return wrapped
+
+
+def nodebug_setup_module(module):
+    """
+    A setup_module() that you can install in a test module to disable
+    debug facilities.
+    """
+    module._old_asyncio_debug = os.environ.get("PYTHONASYNCIODEBUG")
+    if module._old_asyncio_debug is not None:
+        del os.environ["PYTHONASYNCIODEBUG"]
+
+
+def nodebug_teardown_module(module):
+    """
+    A teardown_module() that you can install in a test module to reenable
+    debug facilities.
+    """
+    if module._old_asyncio_debug is not None:
+        os.environ["PYTHONASYNCIODEBUG"] = module._old_asyncio_debug
 
 
 def inc(x):
@@ -197,6 +271,59 @@ def slowidentity(*args, **kwargs):
         return args
 
 
+# This dict grows at every varying() invocation
+_varying_dict = {}
+_varying_key_gen = itertools.count()
+
+class _ModuleSlot(object):
+    def __init__(self, modname, slotname):
+        self.modname = modname
+        self.slotname = slotname
+
+    def get(self):
+        return getattr(sys.modules[self.modname], self.slotname)
+
+
+def varying(items):
+    """
+    Return a function that returns a result (or raises an exception)
+    from *items* at each call.
+    """
+    # cloudpickle would serialize the *values* of all globals
+    # used by *func* below, so we can't use `global <something>`.
+    # Instead look up the module by name to get the original namespace
+    # and not a copy.
+    slot = _ModuleSlot(__name__, '_varying_dict')
+    key = next(_varying_key_gen)
+    _varying_dict[key] = 0
+
+    def func():
+        dct = slot.get()
+        i = dct[key]
+        if i == len(items):
+            raise IndexError
+        else:
+            x = items[i]
+            dct[key] = i + 1
+            if isinstance(x, Exception):
+                raise x
+            else:
+                return x
+
+    return func
+
+
+def map_varying(itemslists):
+    """
+    Like *varying*, but return the full specification for a map() call
+    on multiple items lists.
+    """
+    def apply(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    return apply, map(varying, itemslists)
+
+
 @gen.coroutine
 def geninc(x, delay=0.02):
     yield gen.sleep(delay)
@@ -259,13 +386,10 @@ def readone(comm):
 
 def run_scheduler(q, nputs, **kwargs):
     from distributed import Scheduler
-    from tornado.ioloop import PeriodicCallback
 
     # On Python 2.7 and Unix, fork() is used to spawn child processes,
     # so avoid inheriting the parent's IO loop.
     with pristine_loop() as loop:
-        PeriodicCallback(lambda: None, 500).start()
-
         scheduler = Scheduler(validate=True, **kwargs)
         done = scheduler.start('127.0.0.1')
 
@@ -279,12 +403,9 @@ def run_scheduler(q, nputs, **kwargs):
 
 def run_worker(q, scheduler_q, **kwargs):
     from distributed import Worker
-    from tornado.ioloop import PeriodicCallback
 
     with log_errors():
         with pristine_loop() as loop:
-            PeriodicCallback(lambda: None, 500).start()
-
             scheduler_addr = scheduler_q.get()
             worker = Worker(scheduler_addr, validate=True, **kwargs)
             loop.run_sync(lambda: worker._start(0))
@@ -301,12 +422,9 @@ def run_worker(q, scheduler_q, **kwargs):
 
 def run_nanny(q, scheduler_q, **kwargs):
     from distributed import Nanny
-    from tornado.ioloop import PeriodicCallback
 
     with log_errors():
         with pristine_loop() as loop:
-            PeriodicCallback(lambda: None, 500).start()
-
             scheduler_addr = scheduler_q.get()
             worker = Nanny(scheduler_addr, validate=True, **kwargs)
             loop.run_sync(lambda: worker._start(0))
@@ -320,37 +438,39 @@ def run_nanny(q, scheduler_q, **kwargs):
 
 @contextmanager
 def check_active_rpc(loop, active_rpc_timeout=1):
-    if rpc.active > 0:
-        # Streams from a previous test dangling around?
+    active_before = set(rpc.active)
+    if active_before and not PY3:
+        # On Python 2, try to avoid dangling comms before forking workers
         gc.collect()
-    rpc_active = rpc.active
+        active_before = set(rpc.active)
     yield
-    if rpc.active > rpc_active and active_rpc_timeout:
-        # Some streams can take a bit of time to notice their peer
-        # has closed, and keep a coroutine (*) waiting for a CommClosedError
-        # before calling close_rpc() after a CommClosedError.
-        # This would happen especially if a non-localhost address is used,
-        # as Nanny does.
-        # (*) (example: gather_from_workers())
-        deadline = loop.time() + active_rpc_timeout
+    # Some streams can take a bit of time to notice their peer
+    # has closed, and keep a coroutine (*) waiting for a CommClosedError
+    # before calling close_rpc() after a CommClosedError.
+    # This would happen especially if a non-localhost address is used,
+    # as Nanny does.
+    # (*) (example: gather_from_workers())
+    def fail():
+        pytest.fail("some RPCs left active by test: %s"
+                    % (sorted(set(rpc.active) - active_before)))
 
-        @gen.coroutine
-        def wait_a_bit():
-            yield gen.sleep(0.01)
+    @gen.coroutine
+    def wait():
+        yield async_wait_for(lambda: len(set(rpc.active) - active_before) == 0,
+                             timeout=active_rpc_timeout, fail_func=fail)
 
-        logger.info("Waiting for active RPC count to drop down")
-        while rpc.active > rpc_active and loop.time() < deadline:
-            loop.run_sync(wait_a_bit)
-        logger.info("... Finished waiting for active RPC count to drop down")
-
-    assert rpc.active == rpc_active
+    loop.run_sync(wait)
 
 
 @contextmanager
 def cluster(nworkers=2, nanny=False, worker_kwargs={}, active_rpc_timeout=1,
-            scheduler_kwargs={}, should_check_state=True):
+            scheduler_kwargs={}):
     ws = weakref.WeakSet()
-    before = process_state()
+    old_globals = _globals.copy()
+
+    for name, level in logging_levels.items():
+        logging.getLogger(name).setLevel(level)
+
     with pristine_loop() as loop:
         with check_active_rpc(loop, active_rpc_timeout):
             if nanny:
@@ -374,7 +494,8 @@ def cluster(nworkers=2, nanny=False, worker_kwargs={}, active_rpc_timeout=1,
             for i in range(nworkers):
                 q = mp_context.Queue()
                 fn = '_test_worker-%s' % uuid.uuid4()
-                kwargs = merge({'ncores': 1, 'local_dir': fn}, worker_kwargs)
+                kwargs = merge({'ncores': 1, 'local_dir': fn,
+                                'memory_limit': TOTAL_MEMORY}, worker_kwargs)
                 proc = mp_context.Process(target=_run_worker,
                                           args=(q, scheduler_q),
                                           kwargs=kwargs)
@@ -431,10 +552,10 @@ def cluster(nworkers=2, nanny=False, worker_kwargs={}, active_rpc_timeout=1,
 
                 for fn in glob('_test_worker-*'):
                     shutil.rmtree(fn)
+
+                _globals.clear()
+                _globals.update(old_globals)
     assert not ws
-    after = process_state()
-    if should_check_state:
-        check_state(before, after)
 
 
 @gen.coroutine
@@ -454,21 +575,18 @@ def disconnect_all(addresses, timeout=3):
     yield [disconnect(addr, timeout) for addr in addresses]
 
 
-import pytest
-try:
-    slow = pytest.mark.skipif(
-        not pytest.config.getoption("--runslow"),
-        reason="need --runslow option to run")
-except (AttributeError, ValueError):
-    def slow(*args):
+def slow(func):
+    try:
+        if not pytest.config.getoption("--runslow"):
+            func = pytest.mark.skip("need --runslow option to run")(func)
+    except AttributeError:
+        # AttributeError: module 'pytest' has no attribute 'config'
         pass
 
-
-from tornado import gen
-from tornado.ioloop import IOLoop
+    return nodebug(func)
 
 
-def gen_test(timeout=10, should_check_state=True):
+def gen_test(timeout=10):
     """ Coroutine test
 
     @gen_test(timeout=5)
@@ -477,72 +595,18 @@ def gen_test(timeout=10, should_check_state=True):
     """
     def _(func):
         def test_func():
-            before = process_state()
             with pristine_loop() as loop:
                 cor = gen.coroutine(func)
                 try:
                     loop.run_sync(cor, timeout=timeout)
                 finally:
                     loop.stop()
-            after = process_state()
-            if should_check_state:
-                check_state(before, after)
         return test_func
     return _
 
 
 from .scheduler import Scheduler
 from .worker import Worker
-
-
-def process_state():
-    d = {}
-    if not WINDOWS:
-        d['num-fds'] = psutil.Process().num_fds()
-
-    d['used-memory'] = psutil.Process().memory_info().rss
-    return d
-
-
-initial_state = process_state()
-
-
-def check_state(before, after):
-    """ Checks to ensure that process state is relatively clean
-
-    We run process_state before and after each test that creates a local
-    cluster.  This function includes the following checks to ensure that the
-    process hasn't changed too much
-
-    1.  Ensure that the number of file descriptors has not risen much
-    2.  Ensure that the amount of used memory has not risen much
-
-    This isn't yet perfect, we do leak FDs and memory.
-    """
-    if not WINDOWS:
-        start = time()
-        while after['num-fds'] > before['num-fds']:
-            sleep(0.1)
-            if time() > start + 2:
-                diff = after['num-fds'] - before['num-fds']
-                warnings.warn("This test leaked %d file descriptors" % diff)
-                break
-
-    start = time()
-    while after['used-memory'] > before['used-memory'] + 1e7:
-        gc.collect()
-        sleep(0.10)
-        after = process_state()
-        diff = (after['used-memory'] - before['used-memory']) // 1e6
-        if time() > start + 2:
-            warnings.warn("This test leaked %d MB of memory" % diff)
-            break
-
-    print("leaked memory", (after['used-memory'] - before['used-memory']) / 1e6,
-          "total leaked total",  (after['used-memory'] - initial_state['used-memory']) / 1e6)  # , end=' ')
-
-    total_diff = after['used-memory'] - initial_state['used-memory']
-    # assert total_diff < 2e9, total_diff
 
 
 @gen.coroutine
@@ -599,7 +663,7 @@ def iscoroutinefunction(f):
 def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                 scheduler='127.0.0.1', timeout=10, security=None,
                 Worker=Worker, client=False, scheduler_kwargs={},
-                worker_kwargs={}, active_rpc_timeout=1, should_check_state=True):
+                worker_kwargs={}, active_rpc_timeout=1):
     from distributed import Client
     """ Coroutine test with small cluster
 
@@ -611,71 +675,62 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
         start
         end
     """
+    for name, level in logging_levels.items():
+        logging.getLogger(name).setLevel(level)
+
+    worker_kwargs = merge({'memory_limit': TOTAL_MEMORY}, worker_kwargs)
+
     def _(func):
-        cor = func
         if not iscoroutinefunction(func):
-            cor = gen.coroutine(func)
+            func = gen.coroutine(func)
 
         def test_func():
-            before = process_state()
+            old_globals = _globals.copy()
             result = None
+            workers = []
+
             with pristine_loop() as loop:
                 with check_active_rpc(loop, active_rpc_timeout):
-                    s, workers = loop.run_sync(lambda: start_cluster(ncores,
-                                                                     scheduler, loop, security=security,
-                                                                     Worker=Worker,
-                                                                     scheduler_kwargs=scheduler_kwargs,
-                                                                     worker_kwargs=worker_kwargs))
-                    args = [s] + workers
-
-                    if client:
-                        c = []
-
-                        @gen.coroutine
-                        def f():
-                            c2 = yield Client(s.address, loop=loop, security=security,
-                                              asynchronous=True)
-                            c.append(c2)
-                        loop.run_sync(f)
-                        args = c + args
-                    try:
-                        result = loop.run_sync(lambda: cor(*args), timeout=timeout)
-                    finally:
+                    @gen.coroutine
+                    def coro():
+                        s, ws = yield start_cluster(
+                            ncores, scheduler, loop, security=security,
+                            Worker=Worker, scheduler_kwargs=scheduler_kwargs,
+                            worker_kwargs=worker_kwargs)
+                        workers[:] = ws
+                        args = [s] + workers
                         if client:
-                            loop.run_sync(c[0]._close)
-                        loop.run_sync(lambda: end_cluster(s, workers))
+                            c = yield Client(s.address, loop=loop, security=security,
+                                             asynchronous=True)
+                            args = [c] + args
+                        try:
+                            result = yield func(*args)
+                            # for w in workers:
+                            #     assert not w._comms
+                        finally:
+                            if client:
+                                yield c._close()
+                            yield end_cluster(s, workers)
+                            _globals.clear()
+                            _globals.update(old_globals)
 
-                    # for w in workers:
-                    #     assert not w._comms
+                        raise gen.Return(result)
+
+                    result = loop.run_sync(coro, timeout=timeout)
+
             for w in workers:
-                if hasattr(w, 'data'):
-                    w.data.clear()
-            import gc
-            gc.collect()
-            after = process_state()
-            if should_check_state:
-                check_state(before, after)
+                if getattr(w, 'data', None):
+                    try:
+                        w.data.clear()
+                    except EnvironmentError:
+                        # zict backends can fail if their storage directory
+                        # was already removed
+                        pass
+                    del w.data
             return result
 
         return test_func
     return _
-
-
-@contextmanager
-def make_hdfs():
-    from hdfs3 import HDFileSystem
-    # from .hdfs import DaskHDFileSystem
-    basedir = '/tmp/test-distributed'
-    hdfs = HDFileSystem(host='localhost', port=8020)
-    if hdfs.exists(basedir):
-        hdfs.rm(basedir)
-    hdfs.mkdir(basedir)
-
-    try:
-        yield hdfs, basedir
-    finally:
-        if hdfs.exists(basedir):
-            hdfs.rm(basedir)
 
 
 def raises(func, exc=Exception):
@@ -749,6 +804,27 @@ def wait_for_port(address, timeout=5):
         else:
             sock.close()
             break
+
+
+def wait_for(predicate, timeout, fail_func=None, period=0.001):
+    deadline = time() + timeout
+    while not predicate():
+        sleep(period)
+        if time() > deadline:
+            if fail_func is not None:
+                fail_func()
+            pytest.fail("condition not reached until %s seconds" % (timeout,))
+
+
+@gen.coroutine
+def async_wait_for(predicate, timeout, fail_func=None, period=0.001):
+    deadline = time() + timeout
+    while not predicate():
+        yield gen.sleep(period)
+        if time() > deadline:
+            if fail_func is not None:
+                fail_func()
+            pytest.fail("condition not reached until %s seconds" % (timeout,))
 
 
 @memoize

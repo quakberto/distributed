@@ -35,7 +35,7 @@ def test_simple(loop):
             assert any(w.data == {x.key: 2} for w in c.workers)
 
 
-def test_close_twice(loop):
+def test_close_twice():
     cluster = LocalCluster()
     with Client(cluster.scheduler_address) as client:
         f = client.map(inc, range(100))
@@ -50,12 +50,12 @@ def test_close_twice(loop):
 
 
 @pytest.mark.skipif('sys.version_info[0] == 2', reason='multi-loop')
-def test_procs(loop):
+def test_procs():
     with LocalCluster(2, scheduler_port=0, processes=False, threads_per_worker=3,
                       diagnostics_port=None, silence_logs=False) as c:
         assert len(c.workers) == 2
         assert all(isinstance(w, Worker) for w in c.workers)
-        with Client(c.scheduler.address, loop=loop) as e:
+        with Client(c.scheduler.address) as e:
             assert all(w.ncores == 3 for w in c.workers)
             assert all(isinstance(w, Worker) for w in c.workers)
         repr(c)
@@ -64,7 +64,7 @@ def test_procs(loop):
                       diagnostics_port=None, silence_logs=False) as c:
         assert len(c.workers) == 2
         assert all(isinstance(w, Nanny) for w in c.workers)
-        with Client(c.scheduler.address, loop=loop) as e:
+        with Client(c.scheduler.address) as e:
             assert all(v == 3 for v in e.ncores().values())
 
             c.start_worker()
@@ -211,16 +211,6 @@ def test_repeated():
         pass
 
 
-def test_http(loop):
-    from distributed.http import HTTPScheduler
-    import requests
-    with LocalCluster(scheduler_port=0, silence_logs=False,
-                      services={('http', 3485): HTTPScheduler}, diagnostics_port=None,
-                      loop=loop) as c:
-        response = requests.get('http://127.0.0.1:3485/info.json')
-        assert response.ok
-
-
 def test_bokeh(loop):
     pytest.importorskip('bokeh')
     import requests
@@ -245,7 +235,7 @@ def test_blocks_until_full(loop):
         assert len(c.ncores()) > 0
 
 
-@gen_test(should_check_state=False)
+@gen_test()
 def test_scale_up_and_down():
     loop = IOLoop.current()
     cluster = LocalCluster(0, scheduler_port=0, processes=False, silence_logs=False,
@@ -303,7 +293,7 @@ def test_remote_access(loop):
 def test_memory(loop):
     with LocalCluster(scheduler_port=0, processes=False, silence_logs=False,
                       diagnostics_port=None, loop=loop) as cluster:
-        assert sum(w.memory_limit for w in cluster.workers) < TOTAL_MEMORY * 0.8
+        assert sum(w.memory_limit for w in cluster.workers) <= TOTAL_MEMORY
 
 
 def test_memory_nanny(loop):
@@ -312,7 +302,7 @@ def test_memory_nanny(loop):
         with Client(cluster.scheduler_address, loop=loop) as c:
             info = c.scheduler_info()
             assert (sum(w['memory_limit'] for w in info['workers'].values())
-                    < TOTAL_MEMORY * 0.9)
+                    <= TOTAL_MEMORY)
 
 
 def test_death_timeout_raises(loop):
@@ -321,3 +311,21 @@ def test_death_timeout_raises(loop):
                           death_timeout=1e-10, diagnostics_port=None,
                           loop=loop) as cluster:
             pass
+
+
+@pytest.mark.parametrize('processes', [True, False])
+def test_diagnostics_available_at_localhost(loop, processes):
+    pytest.importorskip('bokeh')
+    import requests
+    import random
+    for i in range(3):
+        port = random.randint(10000, 60000)
+        try:
+            with LocalCluster(2, scheduler_port=0, processes=processes,
+                              silence_logs=False, diagnostics_port=port, loop=loop) as c:
+                requests.get('http://localhost:%d/status/' % port, timeout=3)
+                requests.get('http://127.0.0.1:%d/status/' % port, timeout=1)
+        except OSError:
+            pass
+        else:
+            break

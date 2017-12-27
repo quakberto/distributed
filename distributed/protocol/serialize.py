@@ -8,10 +8,7 @@ try:
 except ImportError:
     from toolz import valmap, get_in
 
-try:
-    import msgpack
-except ImportError:
-    import pandas.msgpack as msgpack
+import msgpack
 
 from . import pickle
 from ..compatibility import PY2
@@ -178,10 +175,8 @@ class Serialize(object):
     def __init__(self, data):
         self.data = data
 
-    def __str__(self):
+    def __repr__(self):
         return "<Serialize: %s>" % str(self.data)
-
-    __repr__ = __str__
 
     def __eq__(self, other):
         return (isinstance(other, Serialize) and

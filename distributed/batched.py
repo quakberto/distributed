@@ -56,10 +56,8 @@ class BatchedSend(object):
         self.comm = comm
         self.loop.add_callback(self._background_send)
 
-    def __str__(self):
+    def __repr__(self):
         return '<BatchedSend: %d in buffer>' % len(self.buffer)
-
-    __repr__ = __str__
 
     @gen.coroutine
     def _background_send(self):
@@ -93,6 +91,8 @@ class BatchedSend(object):
             except Exception:
                 logger.exception("Error in batched write")
                 break
+            finally:
+                payload = None  # lose ref
 
         self.stopped.set()
 

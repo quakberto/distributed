@@ -4,11 +4,12 @@ import atexit
 from datetime import timedelta
 import logging
 import os
+import re
 import sys
 import threading
 import weakref
 
-from .compatibility import finalize, Queue as PyQueue
+from .compatibility import finalize, Queue as PyQueue, PY2
 from .utils import mp_context
 
 from tornado import gen
@@ -19,15 +20,26 @@ from tornado.ioloop import IOLoop
 logger = logging.getLogger(__name__)
 
 
+def _loop_add_callback(loop, func, *args):
+    """
+    Helper to silence "IOLoop is closing" exception on IOLoop.add_callback.
+    """
+    try:
+        loop.add_callback(func, *args)
+    except RuntimeError as exc:
+        if not re.search("IOLoop is clos(ed|ing)", str(exc)):
+            raise
+
+
 def _call_and_set_future(loop, future, func, *args, **kwargs):
     try:
         res = func(*args, **kwargs)
     except Exception:
         # Tornado futures are not thread-safe, need to
         # set_result() / set_exc_info() from the loop's thread
-        loop.add_callback(future.set_exc_info, sys.exc_info())
+        _loop_add_callback(loop, future.set_exc_info, sys.exc_info())
     else:
-        loop.add_callback(future.set_result, res)
+        _loop_add_callback(loop, future.set_result, res)
 
 
 class _ProcessState(object):
@@ -135,12 +147,25 @@ class AsyncProcess(object):
         t.daemon = True
         t.start()
 
+    @staticmethod
+    def reset_logger_locks():
+        """ Python 2's logger's locks don't survive a fork event
+
+        https://github.com/dask/distributed/issues/1491
+        """
+        if PY2:
+            for name in logging.Logger.manager.loggerDict.keys():
+                for handler in logging.getLogger(name).handlers:
+                    handler.createLock()
+
     @classmethod
     def _run(cls, target, args, kwargs, parent_alive_pipe, _keep_child_alive):
         # On Python 2 with the fork method, we inherit the _keep_child_alive fd,
         # whether it is passed or not. Therefore, pass it unconditionally and
         # close it here, so that there are no other references to the pipe lying
         # around.
+        cls.reset_logger_locks()
+
         _keep_child_alive.close()
 
         # Child process entry point
@@ -200,7 +225,7 @@ class AsyncProcess(object):
         self = selfref()  # only keep self alive when required
         try:
             if self is not None:
-                self._loop.add_callback(self._on_exit, exitcode)
+                _loop_add_callback(self._loop, self._on_exit, exitcode)
         finally:
             self = None  # lose reference
 

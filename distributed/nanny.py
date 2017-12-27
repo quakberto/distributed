@@ -4,6 +4,7 @@ from datetime import timedelta
 import logging
 from multiprocessing.queues import Empty
 import os
+import psutil
 import shutil
 import threading
 
@@ -12,12 +13,15 @@ from tornado.ioloop import IOLoop, TimeoutError
 from tornado.locks import Event
 
 from .comm import get_address_host, get_local_address_for, unparse_host_port
+from .config import config
 from .core import rpc, RPCClosed, CommClosedError, coerce_to_address
+from .metrics import time
 from .node import ServerNode
 from .process import AsyncProcess
 from .security import Security
-from .utils import get_ip, mp_context, silence_logging, json_load_robust
-from .worker import _ncores, run
+from .utils import (get_ip, mp_context, silence_logging, json_load_robust,
+        ignoring, PeriodicCallback)
+from .worker import _ncores, run, TOTAL_MEMORY
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,7 @@ class Nanny(ServerNode):
         self.death_timeout = death_timeout
         self.preload = preload
         self.contact_address = contact_address
+        self.memory_terminate_fraction = config.get('worker-memory-terminate', 0.95)
 
         self.security = security or Security()
         assert isinstance(self.security, Security)
@@ -66,9 +71,16 @@ class Nanny(ServerNode):
         self.scheduler = rpc(self.scheduler_addr, connection_args=self.connection_args)
         self.services = services
         self.name = name
-        self.memory_limit = memory_limit
         self.quiet = quiet
         self.auto_restart = True
+
+        if memory_limit == 'auto':
+            memory_limit = int(TOTAL_MEMORY * min(1, self.ncores / _ncores))
+        with ignoring(TypeError):
+            memory_limit = float(memory_limit)
+        if isinstance(memory_limit, float) and memory_limit <= 1:
+            memory_limit = memory_limit * TOTAL_MEMORY
+        self.memory_limit = memory_limit
 
         if silence_logs:
             silence_logging(level=silence_logs)
@@ -85,13 +97,14 @@ class Nanny(ServerNode):
                                     connection_args=self.connection_args,
                                     **kwargs)
 
+        pc = PeriodicCallback(self.memory_monitor, 100)
+        self.periodic_callbacks['memory'] = pc
+
         self._listen_address = listen_address
         self.status = 'init'
 
-    def __str__(self):
+    def __repr__(self):
         return "<Nanny: %s, threads: %d>" % (self.worker_address, self.ncores)
-
-    __repr__ = __str__
 
     @gen.coroutine
     def _unregister(self, timeout=10):
@@ -143,6 +156,9 @@ class Nanny(ServerNode):
         if response == 'OK':
             assert self.worker_address
             self.status = 'running'
+
+        for pc in self.periodic_callbacks.values():
+            pc.start()
 
     def start(self, addr_or_port=0):
         self.loop.add_callback(self._start, addr_or_port)
@@ -211,10 +227,31 @@ class Nanny(ServerNode):
 
     @gen.coroutine
     def restart(self, comm=None, timeout=2):
-        if self.process is not None:
-            yield self.kill(timeout=timeout)
-        yield self.instantiate()
-        raise gen.Return('OK')
+        start = time()
+
+        @gen.coroutine
+        def _():
+            if self.process is not None:
+                yield self.kill()
+                yield self.instantiate()
+
+        try:
+            yield gen.with_timeout(timedelta(seconds=timeout), _())
+        except gen.TimeoutError:
+            logger.error("Restart timed out, returning before finished")
+            raise gen.Return('timed out')
+        else:
+            raise gen.Return('OK')
+
+    def memory_monitor(self):
+        """ Track worker's memory.  Restart if it goes above 95% """
+        if self.status != 'running':
+            return
+        memory = psutil.Process(self.process.pid).memory_info().rss
+        frac = memory / self.memory_limit
+        if self.memory_terminate_fraction and frac > self.memory_terminate_fraction:
+            logger.warn("Worker exceeded 95% memory budget.  Restarting")
+            self.process.process.terminate()
 
     def is_alive(self):
         return self.process is not None and self.process.status == 'running'
@@ -398,7 +435,7 @@ class WorkerProcess(object):
         delay = 0.05
         while True:
             if self.status != 'starting':
-                raise ValueError("Worker not started")
+                return
             try:
                 msg = self.init_result_q.get_nowait()
             except Empty:

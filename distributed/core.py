@@ -13,7 +13,7 @@ from six import string_types
 from toolz import assoc
 
 from tornado import gen
-from tornado.ioloop import IOLoop, PeriodicCallback
+from tornado.ioloop import IOLoop
 from tornado.locks import Event
 
 from .comm import (connect, listen, CommClosedError,
@@ -22,7 +22,8 @@ from .comm import (connect, listen, CommClosedError,
 from .config import config
 from .metrics import time
 from .system_monitor import SystemMonitor
-from .utils import get_traceback, truncate_exception, ignoring, shutting_down
+from .utils import (get_traceback, truncate_exception, ignoring, shutting_down,
+                    PeriodicCallback)
 from . import protocol
 
 
@@ -114,13 +115,12 @@ class Server(object):
 
         self.periodic_callbacks = dict()
 
-        pc = PeriodicCallback(self.monitor.update, 500, io_loop=self.io_loop)
+        pc = PeriodicCallback(self.monitor.update, 500)
         self.io_loop.add_callback(pc.start)
         self.periodic_callbacks['monitor'] = pc
 
         self._last_tick = time()
-        pc = PeriodicCallback(self._measure_tick, config.get('tick-time', 20),
-                              io_loop=self.io_loop)
+        pc = PeriodicCallback(self._measure_tick, config.get('tick-time', 20))
         self.io_loop.add_callback(pc.start)
         self.periodic_callbacks['tick'] = pc
 
@@ -379,7 +379,7 @@ class rpc(object):
 
     >>> remote.close_comms()  # doctest: +SKIP
     """
-    active = 0
+    active = weakref.WeakSet()
     comms = ()
     address = None
 
@@ -391,7 +391,7 @@ class rpc(object):
         self.status = 'running'
         self.deserialize = deserialize
         self.connection_args = connection_args
-        rpc.active += 1
+        rpc.active.add(self)
 
     @gen.coroutine
     def live_comm(self):
@@ -462,7 +462,7 @@ class rpc(object):
 
     def close_rpc(self):
         if self.status != 'closed':
-            rpc.active -= 1
+            rpc.active.discard(self)
         self.status = 'closed'
         self.close_comms()
 
@@ -474,7 +474,7 @@ class rpc(object):
 
     def __del__(self):
         if self.status != 'closed':
-            rpc.active -= 1
+            rpc.active.discard(self)
             self.status = 'closed'
             still_open = [comm for comm in self.comms if not comm.closed()]
             if still_open:
@@ -570,11 +570,9 @@ class ConnectionPool(object):
         self.connection_args = connection_args
         self.event = Event()
 
-    def __str__(self):
+    def __repr__(self):
         return "<ConnectionPool: open=%d, active=%d>" % (self.open,
                                                          self.active)
-
-    __repr__ = __str__
 
     def __call__(self, addr=None, ip=None, port=None):
         """ Cached rpc objects """

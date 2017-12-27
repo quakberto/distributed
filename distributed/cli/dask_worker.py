@@ -3,16 +3,15 @@ from __future__ import print_function, division, absolute_import
 import atexit
 import logging
 import os
-import signal
 from sys import exit
 
 import click
 from distributed import Nanny, Worker
 from distributed.utils import get_ip_interface
 from distributed.worker import _ncores
-from distributed.http import HTTPWorker
 from distributed.security import Security
-from distributed.cli.utils import check_python_3, uri_from_host_port
+from distributed.cli.utils import (check_python_3, uri_from_host_port,
+                                   install_signal_handlers)
 from distributed.comm import get_address_host_port
 
 from toolz import valmap
@@ -35,8 +34,6 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
               help="private key file for TLS (in PEM format)")
 @click.option('--worker-port', type=int, default=0,
               help="Serving computation port, defaults to random")
-@click.option('--http-port', type=int, default=0,
-              help="Serving http port, defaults to random")
 @click.option('--nanny-port', type=int, default=0,
               help="Serving nanny port, defaults to random")
 @click.option('--bokeh-port', type=int, default=8789,
@@ -65,10 +62,10 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option('--name', type=str, default='',
               help="A unique name for this worker like 'worker-1'")
 @click.option('--memory-limit', default='auto',
-              help="Number of bytes before spilling data to disk. "
-                   "This can be an integer (nbytes) "
-                   "float (fraction of total memory) "
-                   "or 'auto'")
+              help="Bytes of memory that the worker can use. "
+                   "This can be an integer (bytes), "
+                   "float (fraction of total system memory), "
+                   "'auto', or zero for no memory management")
 @click.option('--reconnect/--no-reconnect', default=True,
               help="Reconnect to scheduler if disconnected")
 @click.option('--nanny/--no-nanny', default=True,
@@ -90,7 +87,7 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
               help='Module that should be loaded by each worker process '
                    'like "foo.bar" or "/path/to/foo.py"')
 def main(scheduler, host, worker_port, listen_address, contact_address,
-         http_port, nanny_port, nthreads, nprocs, nanny, name,
+         nanny_port, nthreads, nprocs, nanny, name,
          memory_limit, pid_file, reconnect, resources, bokeh,
          bokeh_port, local_directory, scheduler_file, interface,
          death_timeout, preload, bokeh_prefix, tls_ca_file,
@@ -158,7 +155,7 @@ def main(scheduler, host, worker_port, listen_address, contact_address,
                 os.remove(pid_file)
         atexit.register(del_pid_file)
 
-    services = {('http', http_port): HTTPWorker}
+    services = {}
 
     if bokeh:
         try:
@@ -216,23 +213,13 @@ def main(scheduler, host, worker_port, listen_address, contact_address,
 
     @gen.coroutine
     def close_all():
-        try:
-            if nanny:
-                yield [n._close(timeout=2) for n in nannies]
-        finally:
-            loop.stop()
+        # Unregister all workers from scheduler
+        if nanny:
+            yield [n._close(timeout=2) for n in nannies]
 
-    def handle_signal(signum, frame):
+    def on_signal(signum):
         logger.info("Exiting on signal %d", signum)
-        if loop._running:
-            loop.add_callback_from_signal(loop.stop)
-        else:
-            exit(0)
-
-    # NOTE: We can't use the generic install_signal_handlers() function from
-    # distributed.cli.utils because we're handling the signal differently.
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+        close_all()
 
     @gen.coroutine
     def run():
@@ -240,15 +227,14 @@ def main(scheduler, host, worker_port, listen_address, contact_address,
         while all(n.status != 'closed' for n in nannies):
             yield gen.sleep(0.2)
 
+    install_signal_handlers(loop, cleanup=on_signal)
+
     try:
         loop.run_sync(run)
     except (KeyboardInterrupt, TimeoutError):
         pass
     finally:
         logger.info("End worker")
-
-    # Clean exit: unregister all workers from scheduler
-    loop.run_sync(close_all)
 
 
 def go():

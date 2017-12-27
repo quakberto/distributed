@@ -118,7 +118,7 @@ def test_persist(c, s, a, b):
 
 
 @gen_cluster(client=True, ncores=[('127.0.0.1', 1, {'resources': {'A': 1}}),
-                                  ('127.0.0.1', 1, {'resources': {'B': 1}})])
+                                  ('127.0.0.1', 1, {'resources': {'B': 11}})])
 def test_compute(c, s, a, b):
     x = delayed(inc)(1)
     y = delayed(inc)(x)
@@ -127,6 +127,12 @@ def test_compute(c, s, a, b):
     yield wait(yy)
 
     assert b.data
+
+    xs = [delayed(inc)(i) for i in range(10, 20)]
+    xxs = c.compute(xs, resources={'B': 1})
+    yield wait(xxs)
+
+    assert len(b.data) > 10
 
 
 @gen_cluster(client=True, ncores=[('127.0.0.1', 1, {'resources': {'A': 1}}),
@@ -185,10 +191,14 @@ def test_prefer_constrained(c, s, a):
     futures = c.map(slowinc, range(1000), delay=0.1)
     constrained = c.map(inc, range(10), resources={'A': 1})
 
+    import traceback, sys
     start = time()
     yield wait(constrained)
     end = time()
-    assert end - start < 1
+    assert end - start < 4
+    has_what = dict(s.has_what)
+    processing = dict(s.processing)
+    assert len(has_what) < len(constrained) + 2  # at most two slowinc's finished
     assert s.processing[a.address]
 
 
@@ -230,11 +240,11 @@ def test_persist_collections(c, s, a, b):
     z = y.map_blocks(lambda x: 2 * x)
     w = z.sum()
 
-    ww, yy = c.persist([w, y], resources={tuple(y._keys()): {'A': 1}})
+    ww, yy = c.persist([w, y], resources={tuple(y.__dask_keys__()): {'A': 1}})
 
     yield wait([ww, yy])
 
-    assert all(tokey(key) in a.data for key in y._keys())
+    assert all(tokey(key) in a.data for key in y.__dask_keys__())
 
 
 @pytest.mark.xfail(reason="Should protect resource keys from optimization")
@@ -247,7 +257,7 @@ def test_dont_optimize_out(c, s, a, b):
     z = y.map_blocks(lambda x: 2 * x)
     w = z.sum()
 
-    yield c.compute(w, resources={tuple(y._keys()): {'A': 1}},)
+    yield c.compute(w, resources={tuple(y.__dask_keys__()): {'A': 1}},)
 
-    for key in map(tokey, y._keys()):
+    for key in map(tokey, y.__dask_keys__()):
         assert 'executing' in str(a.story(key))

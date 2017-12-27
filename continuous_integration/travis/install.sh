@@ -45,21 +45,17 @@ conda install -q -c conda-forge \
     netcdf4 \
     paramiko \
     psutil \
-    pycodestyle \
     pytest=3.1 \
     pytest-faulthandler \
     pytest-timeout \
+    python=$PYTHON \
     requests \
     tblib \
     toolz \
     tornado=4.5 \
     $PACKAGES
 
-if [[ $HDFS == true ]]; then
-    conda install -q libxml2 krb5 boost
-    conda install -q -c conda-forge libhdfs3 libgsasl libntlm
-    pip install -q git+https://github.com/dask/hdfs3 --upgrade
-fi;
+pip install -q pytest-repeat
 
 pip install -q git+https://github.com/dask/dask.git --upgrade
 pip install -q git+https://github.com/joblib/joblib.git --upgrade
@@ -75,6 +71,13 @@ fi;
 
 # Install distributed
 pip install --no-deps -e .
+
+# Update Tornado to desired version
+if [[ $TORNADO == "dev" ]]; then
+    pip install -U https://github.com/tornadoweb/tornado/archive/master.zip
+elif [[ ! -z $TORNADO ]]; then
+    pip install -U tornado==$TORNADO
+fi
 
 # For debugging
 echo -e "--\n--Conda Environment\n--"

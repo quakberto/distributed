@@ -26,12 +26,12 @@ except ImportError:
     np = False
 
 from . import components
-from .components import DashboardComponent
+from .components import DashboardComponent, ProfileTimePlot
 from .core import BokehServer
-from .worker import SystemMonitor, format_time, counters_doc
+from .worker import SystemMonitor, counters_doc
 from .utils import transpose
 from ..metrics import time
-from ..utils import log_errors, format_bytes
+from ..utils import log_errors, format_bytes, format_time
 from ..diagnostics.progress_stream import color_of, progress_quads, nbytes_bar
 from ..diagnostics.progress import AllProgress
 from .task_stream import TaskStreamPlugin
@@ -53,7 +53,8 @@ with open(os.path.join(os.path.dirname(__file__), 'template.html')) as f:
 
 template = jinja2.Template(template_source)
 
-template_variables = {'pages': ['status', 'workers', 'tasks', 'system', 'counters']}
+template_variables = {'pages': ['status', 'workers', 'tasks', 'system',
+                                'profile', 'counters']}
 
 
 def update(source, data):
@@ -135,8 +136,9 @@ class Occupancy(DashboardComponent):
 
             fig = figure(title='Occupancy', tools='', id='bk-occupancy-plot',
                          x_axis_type='datetime', **kwargs)
-            fig.rect(source=self.source, x='x', width='ms', y='y', height=1,
-                     color='color')
+            rect = fig.rect(source=self.source, x='x', width='ms', y='y', height=1,
+                            color='color')
+            rect.nonselection_glyph = None
 
             fig.xaxis.minor_tick_line_alpha = 0
             fig.yaxis.visible = False
@@ -147,7 +149,7 @@ class Occupancy(DashboardComponent):
             tap = TapTool(callback=OpenURL(url='http://@bokeh_address/'))
 
             hover = HoverTool()
-            hover.tooltips = "@worker : @occupancy s.  Click for worker page"
+            hover.tooltips = "@worker : @occupancy s."
             hover.point_policy = 'follow_mouse'
             fig.add_tools(hover, tap)
 
@@ -276,6 +278,7 @@ class CurrentLoad(DashboardComponent):
                                             'nprocessing-color': ['red', 'blue'],
                                             'nbytes': [1, 2],
                                             'nbytes-half': [0.5, 1],
+                                            'nbytes_text': ['1B', '2B'],
                                             'worker': ['a', 'b'],
                                             'y': [1, 2],
                                             'nbytes-color': ['blue', 'blue'],
@@ -283,19 +286,22 @@ class CurrentLoad(DashboardComponent):
 
             processing = figure(title='Tasks Processing', tools='', id='bk-nprocessing-plot',
                                 width=int(width / 2), **kwargs)
-            processing.rect(source=self.source,
-                            x='nprocessing-half', y='y',
-                            width='nprocessing', height=1,
-                            color='nprocessing-color')
+            rect = processing.rect(source=self.source,
+                                   x='nprocessing-half', y='y',
+                                   width='nprocessing', height=1,
+                                   color='nprocessing-color')
             processing.x_range.start = 0
+            rect.nonselection_glyph = None
 
             nbytes = figure(title='Bytes stored', tools='',
                             id='bk-nbytes-worker-plot', width=int(width / 2),
                             **kwargs)
-            nbytes.rect(source=self.source,
-                        x='nbytes-half', y='y',
-                        width='nbytes', height=1,
-                        color='nbytes-color')
+            rect = nbytes.rect(source=self.source,
+                               x='nbytes-half', y='y',
+                               width='nbytes', height=1,
+                               color='nbytes-color')
+            rect.nonselection_glyph = None
+
             nbytes.axis[0].ticker = BasicTicker(mantissas=[1, 256, 512], base=1024)
             nbytes.xaxis[0].formatter = NumeralTickFormatter(format='0.0 b')
             nbytes.xaxis.major_label_orientation = -math.pi / 12
@@ -314,12 +320,12 @@ class CurrentLoad(DashboardComponent):
                 fig.yaxis.visible = False
 
             hover = HoverTool()
-            hover.tooltips = "@worker : @nprocessing tasks.  Click for worker page"
+            hover.tooltips = "@worker : @nprocessing tasks"
             hover.point_policy = 'follow_mouse'
             processing.add_tools(hover)
 
             hover = HoverTool()
-            hover.tooltips = "@worker : @nbytes bytes.  Click for worker page"
+            hover.tooltips = "@worker : @nbytes_text bytes"
             hover.point_policy = 'follow_mouse'
             nbytes.add_tools(hover)
 
@@ -351,6 +357,7 @@ class CurrentLoad(DashboardComponent):
                     processing_color.append('blue')
 
             nbytes = [self.scheduler.worker_bytes[w] for w in workers]
+            nbytes_text = [format_bytes(nb) for nb in nbytes]
             nbytes_color = []
             max_limit = 0
             for w, nb in zip(workers, nbytes):
@@ -377,6 +384,7 @@ class CurrentLoad(DashboardComponent):
                           'nbytes': nbytes,
                           'nbytes-half': [nb / 2 for nb in nbytes],
                           'nbytes-color': nbytes_color,
+                          'nbytes_text': nbytes_text,
                           'bokeh_address': bokeh_addresses,
                           'worker': workers,
                           'y': y}
@@ -479,7 +487,7 @@ class StealingEvents(DashboardComponent):
         with log_errors():
             log = self.steal.log
             n = self.steal.count - self.last
-            log = [log[-i] for i in range(1, n + 1)]
+            log = [log[-i] for i in range(1, n + 1) if isinstance(log[-i], list)]
             self.last = self.steal.count
 
             if log:
@@ -528,7 +536,8 @@ class Events(DashboardComponent):
         with log_errors():
             log = self.scheduler.events[self.name]
             n = self.scheduler.event_counts[self.name] - self.last
-            log = [log[-i] for i in range(1, n + 1)]
+            if log:
+                log = [log[-i] for i in range(1, n + 1)]
             self.last = self.scheduler.event_counts[self.name]
 
             if log:
@@ -994,6 +1003,18 @@ def status_doc(scheduler, extra, doc):
         doc.template_variables.update(extra)
 
 
+def profile_doc(scheduler, extra, doc):
+    with log_errors():
+        doc.title = "Dask Profile"
+        prof = ProfileTimePlot(scheduler, sizing_mode='scale_width', doc=doc)
+        doc.add_root(prof.root)
+        doc.template = template
+        doc.template_variables['active_page'] = 'profile'
+        doc.template_variables.update(extra)
+
+        prof.trigger_update()
+
+
 class BokehScheduler(BokehServer):
     def __init__(self, scheduler, io_loop=None, prefix='', **kwargs):
         self.scheduler = scheduler
@@ -1014,6 +1035,7 @@ class BokehScheduler(BokehServer):
         events = Application(FunctionHandler(partial(events_doc, scheduler, extra)))
         tasks = Application(FunctionHandler(partial(tasks_doc, scheduler, extra)))
         status = Application(FunctionHandler(partial(status_doc, scheduler, extra)))
+        profile = Application(FunctionHandler(partial(profile_doc, scheduler, extra)))
 
         self.apps = {
             '/system': systemmonitor,
@@ -1022,8 +1044,19 @@ class BokehScheduler(BokehServer):
             '/events': events,
             '/counters': counters,
             '/tasks': tasks,
-            '/status': status
+            '/status': status,
+            '/profile': profile,
         }
 
         self.loop = io_loop or scheduler.loop
         self.server = None
+
+    @property
+    def my_server(self):
+        return self.scheduler
+
+    def listen(self, *args, **kwargs):
+        super(BokehScheduler, self).listen(*args, **kwargs)
+
+        from .scheduler_html import get_handlers
+        self.server._tornado.add_handlers(r'.*', get_handlers(self.my_server))

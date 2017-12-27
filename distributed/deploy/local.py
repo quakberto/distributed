@@ -3,16 +3,13 @@ from __future__ import print_function, division, absolute_import
 import atexit
 import logging
 import math
-from threading import Thread
 from time import sleep
-import warnings
 import weakref
 
 from tornado import gen
-from tornado.ioloop import IOLoop
 
 from ..core import CommClosedError
-from ..utils import sync, ignoring, All, silence_logging
+from ..utils import sync, ignoring, All, silence_logging, LoopRunner
 from ..nanny import Nanny
 from ..scheduler import Scheduler
 from ..worker import Worker, _ncores
@@ -62,10 +59,7 @@ class LocalCluster(object):
     def __init__(self, n_workers=None, threads_per_worker=None, processes=True,
                  loop=None, start=True, ip=None, scheduler_port=0,
                  silence_logs=logging.CRITICAL, diagnostics_port=8787,
-                 services={}, worker_services={}, nanny=None, **worker_kwargs):
-        if nanny is not None:
-            warnings.warning("nanny has been deprecated, used processes=")
-            processes = nanny
+                 services={}, worker_services={}, **worker_kwargs):
         self.status = None
         self.processes = processes
         self.silence_logs = silence_logs
@@ -84,14 +78,10 @@ class LocalCluster(object):
             # Overcommit threads per worker, rather than undercommit
             threads_per_worker = max(1, int(math.ceil(_ncores / n_workers)))
 
-        self.loop = loop or IOLoop()
-        if start and not self.loop._running:
-            self._thread = Thread(target=self.loop.start,
-                                  name="LocalCluster loop")
-            self._thread.daemon = True
-            self._thread.start()
-            while not self.loop._running:
-                sleep(0.001)
+        self._loop_runner = LoopRunner(loop=loop)
+        self.loop = self._loop_runner.loop
+        if start:
+            self._loop_runner.start()
 
         if diagnostics_port is not None:
             try:
@@ -118,13 +108,11 @@ class LocalCluster(object):
 
         clusters_to_close.add(self)
 
-    def __str__(self):
+    def __repr__(self):
         return ('LocalCluster(%r, workers=%d, ncores=%d)' %
                 (self.scheduler_address, len(self.workers),
                  sum(w.ncores for w in self.workers))
                 )
-
-    __repr__ = __str__
 
     @gen.coroutine
     def _start(self, ip=None):
@@ -224,41 +212,39 @@ class LocalCluster(object):
 
     @gen.coroutine
     def _close(self):
+        # Can be 'closing' as we're called by close() below
         if self.status == 'closed':
             return
 
-        with ignoring(gen.TimeoutError, CommClosedError, OSError):
-            yield All([w._close() for w in self.workers])
-        with ignoring(gen.TimeoutError, CommClosedError, OSError):
-            yield self.scheduler.close(fast=True)
-        del self.workers[:]
-        self.status = 'closed'
+        try:
+            with ignoring(gen.TimeoutError, CommClosedError, OSError):
+                yield All([w._close() for w in self.workers])
+            with ignoring(gen.TimeoutError, CommClosedError, OSError):
+                yield self.scheduler.close(fast=True)
+            del self.workers[:]
+        finally:
+            self.status = 'closed'
 
-    def close(self):
+    def close(self, timeout=20):
         """ Close the cluster """
         if self.status == 'closed':
             return
 
-        for w in self.workers:
-            self.loop.add_callback(self._stop_worker, w)
-        for i in range(10):
-            if not self.workers:
-                break
-            else:
-                sleep(0.01)
-        if self.loop._running:
-            sync(self.loop, self._close)
-        if hasattr(self, '_thread'):
-            if self.loop._running:
-                self.loop.add_callback(self.loop.stop)
-            try:
-                self._thread.join(timeout=1)
-            finally:
-                try:
-                    self.loop.close()
-                except ValueError:
-                    pass
-            del self._thread
+        try:
+            self.scheduler.clear_task_state()
+
+            for w in self.workers:
+                self.loop.add_callback(self._stop_worker, w)
+            for i in range(10):
+                if not self.workers:
+                    break
+                else:
+                    sleep(0.01)
+            del self.workers[:]
+            self._loop_runner.run_sync(self._close, callback_timeout=timeout)
+            self._loop_runner.stop()
+        finally:
+            self.status = 'closed'
 
     @gen.coroutine
     def scale_up(self, n, **kwargs):
@@ -311,5 +297,5 @@ clusters_to_close = weakref.WeakSet()
 
 @atexit.register
 def close_clusters():
-    for cluster in clusters_to_close:
-        cluster.close()
+    for cluster in list(clusters_to_close):
+        cluster.close(timeout=10)
